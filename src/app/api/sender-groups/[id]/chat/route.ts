@@ -11,7 +11,12 @@ import {
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-const TRANSCRIPT_BUDGET_CHARS = 2_000_000;
+// Sonnet 4.6 has a 1M token context window. ~4 chars per token = ~4M chars total.
+// We budget 3.6M chars (~900k tokens) for the transcript, leaving ~100k tokens
+// for system instructions, chat history, the question, and the response.
+// For any realistic legal-investigation correspondence (even thousands of long
+// emails) this is effectively no limit — trim is a safety net, not a constraint.
+const TRANSCRIPT_BUDGET_CHARS = 3_600_000;
 
 /**
  * POST body:
