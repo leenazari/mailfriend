@@ -48,15 +48,17 @@ export async function askAboutTranscript(opts: {
   question: string;
   history?: ChatHistoryTurn[];
 }): Promise<AskResult> {
-  // The transcript goes into the SYSTEM prompt with cache_control so that
-  // follow-up questions in the same chat session (within ~5 min) read from
-  // cache at ~10% of normal input cost.
+  // 1-hour cache TTL — see https://docs.claude.com/en/build-with-claude/prompt-caching
+  // The beta header is required to enable the extended TTL. Without it,
+  // ttl='1h' silently falls back to the 5-minute default and you pay
+  // for cache writes every time the user pauses for >5 minutes.
   const system: Anthropic.TextBlockParam[] = [
     { type: 'text', text: SYSTEM_INSTRUCTIONS },
     {
       type: 'text',
       text: `<transcript>\n${opts.transcript}\n</transcript>`,
-      cache_control: { type: 'ephemeral' },
+      // @ts-expect-error - SDK types may not include ttl yet on all versions
+      cache_control: { type: 'ephemeral', ttl: '1h' },
     },
   ];
 
@@ -68,12 +70,17 @@ export async function askAboutTranscript(opts: {
   }
   messages.push({ role: 'user', content: opts.question });
 
-  const res = await client().messages.create({
-    model,
-    max_tokens: 1500,
-    system,
-    messages,
-  });
+  const res = await client().messages.create(
+    {
+      model,
+      max_tokens: 1500,
+      system,
+      messages,
+    },
+    {
+      headers: { 'anthropic-beta': 'extended-cache-ttl-2025-04-11' },
+    }
+  );
 
   const text = res.content
     .filter((b): b is Anthropic.TextBlock => b.type === 'text')
@@ -100,14 +107,18 @@ export async function askAboutTranscript(opts: {
 }
 
 /**
- * Estimate $ cost from token usage for Sonnet 4.6.
- * Standard rates: $3 / M input, $15 / M output, $0.30 / M cache read,
- * $3.75 / M cache write (5-min TTL).
+ * Estimate $ cost from token usage for Sonnet 4.6 with 1-hour cache TTL.
+ *
+ * Sonnet 4.6 rates (May 2026):
+ *   Input:           $3.00 / M
+ *   Output:          $15.00 / M
+ *   Cache read:      $0.30 / M       (90% off)
+ *   Cache write 1h:  $6.00 / M       (2x base — see Anthropic pricing page)
  */
 export function estimateCostUsd(usage: AskResult['usage']): number {
   const inCost = (usage.input_tokens / 1_000_000) * 3;
   const outCost = (usage.output_tokens / 1_000_000) * 15;
   const cacheReadCost = (usage.cache_read_input_tokens / 1_000_000) * 0.3;
-  const cacheWriteCost = (usage.cache_creation_input_tokens / 1_000_000) * 3.75;
+  const cacheWriteCost = (usage.cache_creation_input_tokens / 1_000_000) * 6;
   return inCost + outCost + cacheReadCost + cacheWriteCost;
 }
