@@ -2,15 +2,16 @@ import { NextRequest, NextResponse } from 'next/server';
 import { requireUser } from '@/lib/auth';
 import { supabaseAdmin } from '@/lib/supabase';
 import { buildTranscript, MessageRow, trimTranscriptToBudget } from '@/lib/transcript';
-import { askAboutTranscript } from '@/lib/anthropic';
+import { askAboutTranscript, estimateCostUsd } from '@/lib/anthropic';
 
 export const dynamic = 'force-dynamic';
 export const maxDuration = 60;
 
-// Roughly 4 chars per token. Sonnet 4.6 has a large context but
-// keep transcript under ~150k chars (~37k tokens) to leave room
-// for the question, history, and answer.
-const TRANSCRIPT_BUDGET_CHARS = 150_000;
+// Sonnet 4.6 supports up to ~1M tokens. ~4 chars per token, so ~4M chars
+// of total context. We budget 2M chars for the transcript itself (~500k
+// tokens) — enough for very large legal histories — and leave headroom
+// for the question, chat history, system instructions, and response.
+const TRANSCRIPT_BUDGET_CHARS = 2_000_000;
 
 export async function POST(
   req: NextRequest,
@@ -36,7 +37,7 @@ export async function POST(
     const fullTranscript = buildTranscript((data ?? []) as unknown as MessageRow[]);
     const transcript = trimTranscriptToBudget(fullTranscript, TRANSCRIPT_BUDGET_CHARS);
 
-    const answer = await askAboutTranscript({
+    const result = await askAboutTranscript({
       transcript,
       question,
       history: history
@@ -44,10 +45,19 @@ export async function POST(
           (m: { role?: string; content?: string }) =>
             (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string'
         )
-        .slice(-10), // keep recent turns only
+        .slice(-10),
     });
 
-    return NextResponse.json({ answer, truncated: fullTranscript.length > transcript.length });
+    const cost = estimateCostUsd(result.usage);
+
+    return NextResponse.json({
+      answer: result.answer,
+      truncated: fullTranscript.length > transcript.length,
+      transcript_chars: transcript.length,
+      total_chars: fullTranscript.length,
+      usage: result.usage,
+      cost_usd: cost,
+    });
   } catch (res) {
     if (res instanceof Response) return res;
     return NextResponse.json({ error: String(res) }, { status: 500 });
