@@ -1496,7 +1496,6 @@ async function buildEvidenceZip(opts: {
   }
 
   // Page numbers
-  // @ts-expect-error - getNumberOfPages exists at runtime on jsPDF
   const totalPages: number = doc.getNumberOfPages();
   for (let i = 1; i <= totalPages; i += 1) {
     doc.setPage(i);
