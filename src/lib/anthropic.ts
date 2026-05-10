@@ -10,33 +10,63 @@ function client(): Anthropic {
   return _client;
 }
 
+const SYSTEM_INSTRUCTIONS = [
+  'You are an analyst helping the user understand their email correspondence',
+  'with a specific person or company. The system prompt below contains the',
+  'full transcript of that correspondence (with attachments transcribed inline)',
+  'and the user will ask questions about it.',
+  '',
+  'Ground every answer strictly in the transcript. If something is not in the',
+  'transcript, say so plainly rather than guessing. When facts matter — promises',
+  'made, dates, response times, specific commitments, what was said and when —',
+  'quote the exact text and cite the date and sender. Be concise and direct;',
+  'the user is a busy CEO who wants the signal, not a recap.',
+  '',
+  'When the user is investigating a potential complaint, misselling claim, or',
+  'legal case: be a paralegal, not a defender. Surface every promise broken,',
+  'every concern that went unaddressed, every unreasonable delay. Quote dates',
+  'and exact words. Do not soften.',
+].join('\n');
+
+export interface ChatHistoryTurn {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export interface AskResult {
+  answer: string;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  };
+}
+
 export async function askAboutTranscript(opts: {
   transcript: string;
   question: string;
-  history?: { role: 'user' | 'assistant'; content: string }[];
-}): Promise<string> {
-  const system = [
-    'You are an analyst helping the user understand their email correspondence',
-    'with a specific person or company. The user will paste a full transcript',
-    'of their conversation history (with attachments transcribed inline) and',
-    'then ask questions about it.',
-    '',
-    'Ground every answer in the transcript. If something is not in the transcript,',
-    'say so plainly rather than guessing. Cite specific dates and senders when',
-    'they sharpen the answer. Be concise and direct — the user is a busy CEO',
-    'who wants the signal, not a recap.',
-  ].join('\n');
-
-  const transcriptBlock = `<transcript>\n${opts.transcript}\n</transcript>`;
+  history?: ChatHistoryTurn[];
+}): Promise<AskResult> {
+  // The transcript goes into the SYSTEM prompt with cache_control so that
+  // follow-up questions in the same chat session (within ~5 min) read from
+  // cache at ~10% of normal input cost.
+  const system: Anthropic.TextBlockParam[] = [
+    { type: 'text', text: SYSTEM_INSTRUCTIONS },
+    {
+      type: 'text',
+      text: `<transcript>\n${opts.transcript}\n</transcript>`,
+      cache_control: { type: 'ephemeral' },
+    },
+  ];
 
   const messages: Anthropic.MessageParam[] = [];
   if (opts.history) {
-    for (const m of opts.history) messages.push({ role: m.role, content: m.content });
+    for (const m of opts.history) {
+      messages.push({ role: m.role, content: m.content });
+    }
   }
-  messages.push({
-    role: 'user',
-    content: `${transcriptBlock}\n\nQuestion: ${opts.question}`,
-  });
+  messages.push({ role: 'user', content: opts.question });
 
   const res = await client().messages.create({
     model,
@@ -50,5 +80,34 @@ export async function askAboutTranscript(opts: {
     .map((b) => b.text)
     .join('\n')
     .trim();
-  return text || '(no response)';
+
+  const usage = res.usage as unknown as {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
+
+  return {
+    answer: text || '(no response)',
+    usage: {
+      input_tokens: usage.input_tokens ?? 0,
+      output_tokens: usage.output_tokens ?? 0,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
+      cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+    },
+  };
+}
+
+/**
+ * Estimate $ cost from token usage for Sonnet 4.6.
+ * Standard rates: $3 / M input, $15 / M output, $0.30 / M cache read,
+ * $3.75 / M cache write (5-min TTL).
+ */
+export function estimateCostUsd(usage: AskResult['usage']): number {
+  const inCost = (usage.input_tokens / 1_000_000) * 3;
+  const outCost = (usage.output_tokens / 1_000_000) * 15;
+  const cacheReadCost = (usage.cache_read_input_tokens / 1_000_000) * 0.3;
+  const cacheWriteCost = (usage.cache_creation_input_tokens / 1_000_000) * 3.75;
+  return inCost + outCost + cacheReadCost + cacheWriteCost;
 }
