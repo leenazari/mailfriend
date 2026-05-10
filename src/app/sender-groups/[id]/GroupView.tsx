@@ -71,9 +71,15 @@ export default function GroupView({ group: initialGroup }: { group: Group }) {
       if (!res.ok) {
         setSyncResult(`Error: ${json.error ?? 'unknown'}`);
       } else {
-        setSyncResult(
-          `Found ${json.fetched} · added ${json.inserted} · skipped ${json.skipped} · ${json.pdfs} PDFs`
-        );
+        const parts = [
+          `${json.fetched} found`,
+          `${json.inserted} new emails`,
+          `${json.skipped} already saved`,
+        ];
+        if (json.pdfs_added > 0) parts.push(`${json.pdfs_added} new PDFs`);
+        if (json.pdfs_backfilled > 0) parts.push(`${json.pdfs_backfilled} PDFs backfilled`);
+        if (json.errors && json.errors.length > 0) parts.push(`${json.errors.length} errors`);
+        setSyncResult(parts.join(' · '));
         setGroup({ ...group, last_synced_at: new Date().toISOString() });
         await loadMessages();
         setTranscript(null);
@@ -135,7 +141,9 @@ export default function GroupView({ group: initialGroup }: { group: Group }) {
       </div>
 
       {tab === 'log' && <LogView messages={messages} />}
-      {tab === 'transcript' && <TranscriptView text={transcript} />}
+      {tab === 'transcript' && (
+        <TranscriptView text={transcript} groupId={group.id} groupName={group.name} />
+      )}
       {tab === 'chat' && (
         <ChatView groupId={group.id} hasMessages={(messages?.length ?? 0) > 0} />
       )}
@@ -376,14 +384,25 @@ function MessageDetail({
                   key={a.id}
                   className="border border-ink-800 rounded-lg overflow-hidden"
                 >
-                  <summary className="cursor-pointer px-4 py-3 bg-ink-900 hover:bg-ink-800 text-sm flex items-center justify-between transition-colors">
-                    <span className="font-mono">
+                  <summary className="cursor-pointer px-4 py-3 bg-ink-900 hover:bg-ink-800 text-sm flex items-center justify-between gap-4 transition-colors">
+                    <span className="font-mono truncate">
                       📎 <Highlight text={a.filename} query={highlight} />
                     </span>
-                    <span className="text-xs text-ink-400 font-mono">
-                      {a.extracted_text
-                        ? `${a.extracted_text.length.toLocaleString()} chars`
-                        : 'no extractable text'}
+                    <span className="flex items-center gap-3 shrink-0">
+                      <span className="text-xs text-ink-400 font-mono">
+                        {a.extracted_text
+                          ? `${a.extracted_text.length.toLocaleString()} chars`
+                          : 'no extractable text'}
+                      </span>
+                      <a
+                        href={`/api/attachments/${a.id}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => e.stopPropagation()}
+                        className="text-xs font-mono text-accent hover:text-accent-dim px-2 py-1 border border-accent/30 rounded hover:border-accent/60 transition-colors"
+                      >
+                        open ↗
+                      </a>
                     </span>
                   </summary>
                   {a.extracted_text && (
@@ -437,22 +456,171 @@ function DirBadge({ dir }: { dir: MessageRow['direction'] }) {
 
 // ---------- Transcript view ----------
 
-function TranscriptView({ text }: { text: string | null }) {
+function TranscriptView({
+  text,
+  groupId,
+  groupName,
+}: {
+  text: string | null;
+  groupId: string;
+  groupName: string;
+}) {
+  const [exporting, setExporting] = useState(false);
+
   if (text === null) return <Empty>Building transcript…</Empty>;
   if (!text || text === '(no messages)')
     return <Empty>No transcript yet — sync first.</Empty>;
+
+  async function exportPdf() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      const { jsPDF } = await import('jspdf');
+      const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+      const pageWidth = doc.internal.pageSize.getWidth();
+      const pageHeight = doc.internal.pageSize.getHeight();
+      const margin = 40;
+      const usableWidth = pageWidth - margin * 2;
+      let y = margin;
+
+      const ensureSpace = (needed: number) => {
+        if (y + needed > pageHeight - margin) {
+          doc.addPage();
+          y = margin;
+        }
+      };
+
+      // Title
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(16);
+      doc.text(groupName, margin, y);
+      y += 22;
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(8);
+      doc.setTextColor(120);
+      doc.text(
+        `MailFriend transcript · exported ${new Date().toLocaleString()}`,
+        margin,
+        y
+      );
+      doc.setTextColor(0);
+      y += 16;
+      doc.setDrawColor(150);
+      doc.line(margin, y, pageWidth - margin, y);
+      y += 16;
+
+      // Split transcript on the "── " separator we emit in transcript.ts.
+      const blocks = (text as string).split(/(?=^── )/m).filter((b) => b.trim().length > 0);
+
+      for (const block of blocks) {
+        const lines = block.split('\n');
+        const headerLine = lines[0]?.startsWith('── ')
+          ? lines[0].replace(/^── /, '').replace(/^…/, '… ')
+          : null;
+
+        if (headerLine) {
+          ensureSpace(40);
+          y += 6;
+          doc.setDrawColor(200);
+          doc.line(margin, y, pageWidth - margin, y);
+          y += 12;
+          // Date / direction header in bold
+          doc.setFont('helvetica', 'bold');
+          doc.setFontSize(11);
+          doc.text(headerLine, margin, y);
+          y += 14;
+
+          // Subject / From / To / Cc — use monospace for that "legal log" feel
+          doc.setFont('courier', 'normal');
+          doc.setFontSize(9);
+          let i = 1;
+          while (
+            i < lines.length &&
+            (lines[i].startsWith('Subject:') ||
+              lines[i].startsWith('From:') ||
+              lines[i].startsWith('To:') ||
+              lines[i].startsWith('Cc:'))
+          ) {
+            const wrapped = doc.splitTextToSize(lines[i], usableWidth);
+            for (const w of wrapped) {
+              ensureSpace(12);
+              doc.text(w, margin, y);
+              y += 11;
+            }
+            i += 1;
+          }
+          y += 6;
+
+          // Body — normal helvetica
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(10);
+          for (; i < lines.length; i += 1) {
+            const line = lines[i];
+            if (line.startsWith('[attachment:')) {
+              doc.setFont('helvetica', 'italic');
+              doc.setTextColor(120);
+              ensureSpace(14);
+              y += 4;
+              doc.text(line, margin, y);
+              y += 12;
+              doc.setFont('helvetica', 'normal');
+              doc.setTextColor(0);
+              continue;
+            }
+            const wrapped = doc.splitTextToSize(line || ' ', usableWidth);
+            for (const w of wrapped) {
+              ensureSpace(13);
+              doc.text(w, margin, y);
+              y += 12;
+            }
+          }
+          y += 6;
+        } else {
+          // Fallback for any unrecognised block — just dump as text
+          doc.setFont('helvetica', 'normal');
+          doc.setFontSize(10);
+          for (const line of lines) {
+            const wrapped = doc.splitTextToSize(line || ' ', usableWidth);
+            for (const w of wrapped) {
+              ensureSpace(13);
+              doc.text(w, margin, y);
+              y += 12;
+            }
+          }
+        }
+      }
+
+      const safeName = groupName.replace(/[^a-z0-9-]+/gi, '-').toLowerCase();
+      const date = new Date().toISOString().slice(0, 10);
+      doc.save(`mailfriend-${safeName}-${date}.pdf`);
+    } catch (e) {
+      alert(`PDF export failed: ${(e as Error).message}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <div className="border border-ink-800 rounded-lg overflow-hidden">
       <div className="px-4 py-2 border-b border-ink-800 bg-ink-900 flex items-center justify-between">
         <div className="text-xs font-mono uppercase tracking-wider text-ink-400">
           {text.length.toLocaleString()} chars
         </div>
-        <button
-          onClick={() => navigator.clipboard.writeText(text)}
-          className="text-xs font-mono text-ink-400 hover:text-ink-100"
-        >
-          copy all
-        </button>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => navigator.clipboard.writeText(text)}
+            className="text-xs font-mono text-ink-400 hover:text-ink-100"
+          >
+            copy all
+          </button>
+          <button
+            onClick={exportPdf}
+            disabled={exporting}
+            className="text-xs font-mono text-accent hover:text-accent-dim disabled:opacity-50"
+          >
+            {exporting ? 'building…' : 'download as PDF'}
+          </button>
+        </div>
       </div>
       <pre className="p-5 text-xs font-mono whitespace-pre-wrap leading-relaxed text-ink-200 max-h-[70vh] overflow-y-auto">
         {text}
@@ -461,26 +629,100 @@ function TranscriptView({ text }: { text: string | null }) {
   );
 }
 
-// ---------- Chat view ----------
+// ---------- Chat view (persistent threads) ----------
 
 interface ChatTurn {
+  id?: string;
   role: 'user' | 'assistant';
   content: string;
+  cost_usd?: number;
+  cached?: boolean;
+  created_at?: string;
+}
+
+interface ThreadSummary {
+  id: string;
+  title: string | null;
+  total_cost_usd: number;
+  message_count: number;
+  created_at: string;
+  updated_at: string;
 }
 
 function ChatView({ groupId, hasMessages }: { groupId: string; hasMessages: boolean }) {
+  const [threads, setThreads] = useState<ThreadSummary[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null);
+  const [activeThreadCost, setActiveThreadCost] = useState(0);
   const [history, setHistory] = useState<ChatTurn[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [loadingThread, setLoadingThread] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [truncated, setTruncated] = useState(false);
-  const [sessionCost, setSessionCost] = useState(0);
   const [lastQueryInfo, setLastQueryInfo] = useState<{
     cost: number;
     cached: boolean;
     transcriptChars: number;
     totalChars: number;
   } | null>(null);
+
+  // Load threads list on mount
+  async function refreshThreads() {
+    try {
+      const res = await fetch(`/api/sender-groups/${groupId}/threads`);
+      const json = await res.json();
+      setThreads(json.threads ?? []);
+    } catch {
+      /* silent */
+    }
+  }
+
+  useEffect(() => {
+    refreshThreads();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Load a specific thread's messages
+  async function selectThread(threadId: string) {
+    if (threadId === activeThreadId) return;
+    setLoadingThread(true);
+    setError(null);
+    setLastQueryInfo(null);
+    setTruncated(false);
+    try {
+      const res = await fetch(`/api/sender-groups/${groupId}/threads/${threadId}`);
+      const json = await res.json();
+      if (!res.ok) {
+        setError(json.error ?? 'Failed to load thread.');
+      } else {
+        setActiveThreadId(threadId);
+        setActiveThreadCost(Number(json.thread?.total_cost_usd ?? 0));
+        setHistory(
+          (json.messages ?? []).map((m: ChatTurn) => ({
+            id: m.id,
+            role: m.role,
+            content: m.content,
+            cost_usd: m.cost_usd,
+            cached: m.cached,
+            created_at: m.created_at,
+          }))
+        );
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoadingThread(false);
+    }
+  }
+
+  function newConversation() {
+    setActiveThreadId(null);
+    setActiveThreadCost(0);
+    setHistory([]);
+    setLastQueryInfo(null);
+    setTruncated(false);
+    setError(null);
+  }
 
   if (!hasMessages)
     return <Empty>Sync messages first, then ask away.</Empty>;
@@ -490,55 +732,101 @@ function ChatView({ groupId, hasMessages }: { groupId: string; hasMessages: bool
     if (!q || loading) return;
     setInput('');
     setError(null);
-    const newHistory: ChatTurn[] = [...history, { role: 'user', content: q }];
-    setHistory(newHistory);
+    const optimistic: ChatTurn[] = [...history, { role: 'user', content: q }];
+    setHistory(optimistic);
     setLoading(true);
     try {
       const res = await fetch(`/api/sender-groups/${groupId}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question: q, history }),
+        body: JSON.stringify({
+          question: q,
+          thread_id: activeThreadId,
+        }),
       });
       const json = await res.json();
       if (!res.ok) {
         setError(json.error ?? 'Failed.');
+        // Roll back optimistic message — server didn't save it.
+        setHistory(history);
       } else {
-        setHistory([...newHistory, { role: 'assistant', content: json.answer }]);
+        if (!activeThreadId) setActiveThreadId(json.thread_id);
+        setHistory([
+          ...optimistic,
+          {
+            id: json.message_id,
+            role: 'assistant',
+            content: json.answer,
+            cost_usd: json.cost_usd,
+            cached: json.cached,
+          },
+        ]);
         setTruncated(Boolean(json.truncated));
         if (typeof json.cost_usd === 'number') {
-          setSessionCost((c) => c + json.cost_usd);
+          setActiveThreadCost((c) => c + json.cost_usd);
           setLastQueryInfo({
             cost: json.cost_usd,
-            cached: (json.usage?.cache_read_input_tokens ?? 0) > 0,
+            cached: Boolean(json.cached),
             transcriptChars: json.transcript_chars ?? 0,
             totalChars: json.total_chars ?? 0,
           });
         }
+        // Refresh the threads list to update titles, counts, costs.
+        refreshThreads();
       }
     } catch (e) {
       setError((e as Error).message);
+      setHistory(history);
     } finally {
       setLoading(false);
     }
   }
 
+  const isNewConversation = !activeThreadId && history.length === 0;
+  const activeThread = threads.find((t) => t.id === activeThreadId);
+
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-[1fr_280px] gap-6">
-      <div className="border border-ink-800 rounded-lg flex flex-col h-[70vh]">
+    <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px] gap-6">
+      <div className="border border-ink-800 rounded-lg flex flex-col h-[72vh]">
+        {/* Active conversation header */}
+        <div className="border-b border-ink-800 px-5 py-3 flex items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="text-sm font-medium truncate">
+              {activeThread?.title ?? (isNewConversation ? 'New conversation' : 'Conversation')}
+            </div>
+            {activeThread && (
+              <div className="text-xs font-mono text-ink-400 mt-0.5">
+                {activeThread.message_count} messages · ${Number(activeThread.total_cost_usd).toFixed(4)}
+              </div>
+            )}
+          </div>
+          {!isNewConversation && (
+            <button
+              onClick={newConversation}
+              className="text-xs font-mono text-ink-400 hover:text-ink-100 whitespace-nowrap"
+            >
+              + new
+            </button>
+          )}
+        </div>
+
         <div className="flex-1 overflow-y-auto p-5 space-y-5">
-          {history.length === 0 && (
+          {loadingThread && (
+            <div className="text-xs font-mono text-ink-400">loading conversation…</div>
+          )}
+          {!loadingThread && history.length === 0 && (
             <div className="text-ink-400 text-sm">
-              Try things like:
-              <ul className="mt-2 space-y-1 text-ink-200">
+              <div className="mb-3">Try things like:</div>
+              <ul className="space-y-1 text-ink-200">
                 <li>· What were the last 3 things we agreed on?</li>
-                <li>· Summarize the contract negotiation in 5 bullets.</li>
-                <li>· Were any deadlines mentioned, and have they passed?</li>
-                <li>· What numbers did they quote me, and when?</li>
+                <li>· Build a case assessment: list every promise broken, every concern unaddressed, with dates and exact quotes.</li>
+                <li>· Map response times — when I raised issues, how long until they replied, and did they actually address the concern?</li>
+                <li>· Pull out the strongest 3-5 pieces of evidence for a misselling claim.</li>
               </ul>
             </div>
           )}
           {history.map((t, i) => (
-            <div key={i} className={t.role === 'user' ? 'text-right' : ''}>
+            <div key={t.id ?? i} className={t.role === 'user' ? 'text-right' : ''}>
               <div
                 className={`inline-block max-w-[85%] rounded-lg px-4 py-3 text-sm leading-relaxed whitespace-pre-wrap text-left ${
                   t.role === 'user'
@@ -584,16 +872,58 @@ function ChatView({ groupId, hasMessages }: { groupId: string; hasMessages: bool
       </div>
 
       <aside className="space-y-4">
+        {/* Conversations */}
+        <div className="border border-ink-800 rounded-lg overflow-hidden">
+          <div className="px-4 py-3 border-b border-ink-800 bg-ink-900 flex items-center justify-between">
+            <div className="text-xs font-mono uppercase tracking-wider text-ink-400">
+              Conversations
+            </div>
+            <button
+              onClick={newConversation}
+              className="text-xs font-mono text-accent hover:text-accent-dim"
+            >
+              + new
+            </button>
+          </div>
+          <div className="max-h-[280px] overflow-y-auto">
+            {threads.length === 0 ? (
+              <div className="px-4 py-6 text-xs text-ink-400 text-center">
+                No conversations yet. Ask a question to start one.
+              </div>
+            ) : (
+              <div className="divide-y divide-ink-800">
+                {threads.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => selectThread(t.id)}
+                    className={`w-full text-left px-4 py-3 hover:bg-ink-900 transition-colors ${
+                      t.id === activeThreadId ? 'bg-ink-900 border-l-2 border-accent' : ''
+                    }`}
+                  >
+                    <div className="text-sm truncate font-medium">
+                      {t.title ?? '(untitled)'}
+                    </div>
+                    <div className="text-xs font-mono text-ink-400 mt-1 flex items-center gap-2">
+                      <span>{relativeTime(t.updated_at)}</span>
+                      <span>·</span>
+                      <span>{t.message_count} msg</span>
+                      <span>·</span>
+                      <span>${Number(t.total_cost_usd).toFixed(3)}</span>
+                    </div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Cost meter */}
         <div className="border border-ink-800 rounded-lg p-4">
           <div className="text-xs font-mono uppercase tracking-wider text-ink-400 mb-3">
-            Session cost
+            This conversation
           </div>
           <div className="text-3xl font-medium tracking-tight tabular-nums">
-            ${sessionCost.toFixed(4)}
-          </div>
-          <div className="text-xs text-ink-400 mt-1">
-            {history.filter((t) => t.role === 'user').length} question
-            {history.filter((t) => t.role === 'user').length === 1 ? '' : 's'} this session
+            ${activeThreadCost.toFixed(4)}
           </div>
           {lastQueryInfo && (
             <div className="mt-4 pt-4 border-t border-ink-800 space-y-1.5 text-xs font-mono">
@@ -617,17 +947,6 @@ function ChatView({ groupId, hasMessages }: { groupId: string; hasMessages: bool
           )}
         </div>
 
-        <div className="border border-ink-800 rounded-lg p-4">
-          <div className="text-xs font-mono uppercase tracking-wider text-ink-400 mb-2">
-            How it works
-          </div>
-          <p className="text-xs text-ink-200 leading-relaxed">
-            The full transcript is sent to Claude with your question. Answers are
-            grounded in what&apos;s in your inbox — if it&apos;s not there, Claude says so.
-            Follow-up questions reuse a cached transcript and are ~90% cheaper.
-          </p>
-        </div>
-
         {truncated && (
           <div className="border border-amber-500/30 bg-amber-500/5 rounded-lg p-4">
             <div className="text-xs font-mono uppercase tracking-wider text-amber-400 mb-2">
@@ -642,6 +961,19 @@ function ChatView({ groupId, hasMessages }: { groupId: string; hasMessages: bool
       </aside>
     </div>
   );
+}
+
+function relativeTime(iso: string): string {
+  const diff = Date.now() - new Date(iso).getTime();
+  const m = Math.floor(diff / 60_000);
+  if (m < 1) return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  const w = Math.floor(d / 7);
+  return `${w}w ago`;
 }
 
 // ---------- shared bits ----------
