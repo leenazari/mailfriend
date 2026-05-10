@@ -60,13 +60,31 @@ export function buildTranscript(messages: MessageRow[]): string {
   return blocks.join('\n\n');
 }
 
-/** Trim transcript to a rough character budget, keeping the most recent. */
+/**
+ * Trim transcript to a rough character budget. If trimming is required,
+ * keep BOTH ends: the earliest messages (often where promises and key
+ * commitments live — critical for legal cases) AND the most recent.
+ * Drop a chunk from the middle and replace with a marker.
+ */
 export function trimTranscriptToBudget(transcript: string, maxChars: number): string {
   if (transcript.length <= maxChars) return transcript;
-  const tail = transcript.slice(-maxChars);
-  const firstBlockBoundary = tail.indexOf('\n── ');
+
+  // 45% to head, 45% to tail, 10% slack for markers + finding block boundaries.
+  const halfBudget = Math.floor(maxChars * 0.45);
+  const head = transcript.slice(0, halfBudget);
+  const tail = transcript.slice(-halfBudget);
+
+  // Snap to the nearest message boundary so we don't cut a message in half.
+  const lastBoundaryInHead = head.lastIndexOf('\n\n── ');
+  const headClean = lastBoundaryInHead > 0 ? head.slice(0, lastBoundaryInHead) : head;
+
+  const firstBoundaryInTail = tail.indexOf('\n── ');
+  const tailClean = firstBoundaryInTail >= 0 ? tail.slice(firstBoundaryInTail + 1) : tail;
+
+  const omittedChars = transcript.length - headClean.length - tailClean.length;
   return (
-    '… [earlier messages omitted to fit context] …\n\n' +
-    (firstBlockBoundary >= 0 ? tail.slice(firstBlockBoundary + 1) : tail)
+    headClean +
+    `\n\n── … [${omittedChars.toLocaleString()} chars of middle correspondence omitted to fit context] … ──\n\n` +
+    tailClean
   );
 }
